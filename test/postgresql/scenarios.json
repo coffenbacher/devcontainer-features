@@ -61,5 +61,15 @@
                 "version": "17"
             }
         }
+    },
+    "version_17_postgis": {
+        "image": "mcr.microsoft.com/devcontainers/base:jammy",
+        "user": "vscode",
+        "features": {
+            "postgresql": {
+                "version": "17",
+                "postgis": true
+            }
+        }
     }
 }

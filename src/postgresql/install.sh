@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 
 PG_VERSION=${VERSION:-"latest"}
+ENABLE_POSTGIS=${POSTGIS:-"false"}
 PG_ARCHIVE_ARCHITECTURES="amd64 arm64 i386 ppc64el"
 PG_ARCHIVE_VERSION_CODENAMES="bookworm bullseye buster sid bionic focal jammy kinetic noble"
 USERNAME="${USERNAME:-"${_REMOTE_USER:-"automatic"}"}"
@@ -38,6 +39,12 @@ elif [ "${USERNAME}" = "none" ] || ! id -u ${USERNAME} > /dev/null 2>&1; then
     USERNAME=root
 fi
 
+# Configure passwordless sudo for the user to allow PostgreSQL tests
+if [ "${USERNAME}" != "root" ]; then
+    echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/${USERNAME}
+    chmod 0440 /etc/sudoers.d/${USERNAME}
+fi
+
 apt_get_update()
 {
     if [ "$(find /var/lib/apt/lists/* | wc -l)" = "0" ]; then
@@ -55,23 +62,23 @@ check_packages() {
 }
 
 setup_pq() {
-    tee /usr/local/share/pq-init.sh << 'EOF'
+    tee /usr/local/share/pq-init.sh << EOF
 #!/bin/sh
 set -e
 
-version_major=$(psql --version | sed -z "s/psql (PostgreSQL) //g" | grep -Eo -m 1 "^([0-9]+)" | sed -z "s/-//g")
+version_path=\$(psql --version | sed -z "s/psql (PostgreSQL) //g" | grep -Eo -m 1 "^([0-9]+)")
 
-echo "listen_addresses = '*'" >> /etc/postgresql/${version_major}/main/postgresql.conf \
-    && echo "data_directory = '$PGDATA'" >> /etc/postgresql/${version_major}/main/postgresql.conf \
-    && echo "host   all all 0.0.0.0/0        trust" > /etc/postgresql/${version_major}/main/pg_hba.conf \
-    && echo "host   all all ::/0             trust" >> /etc/postgresql/${version_major}/main/pg_hba.conf \
-    && echo "host   all all ::1/128          trust" >> /etc/postgresql/${version_major}/main/pg_hba.conf
+echo "listen_addresses = '*'" >> /etc/postgresql/\${version_path}/main/postgresql.conf \
+    && echo "data_directory = '\$PGDATA'" >> /etc/postgresql/\${version_path}/main/postgresql.conf \
+    && echo "host   all all 0.0.0.0/0        trust" > /etc/postgresql/\${version_path}/main/pg_hba.conf \
+    && echo "host   all all ::/0             trust" >> /etc/postgresql/\${version_path}/main/pg_hba.conf \
+    && echo "host   all all ::1/128          trust" >> /etc/postgresql/\${version_path}/main/pg_hba.conf
 
-if [ ! -f "$PGDATA/PG_VERSION" ]; then
+if [ ! -f "\$PGDATA/PG_VERSION" ]; then
     echo "Initializing PostgreSQL database..."
-    chown -R postgres:postgres $PGDATA \
-        && chmod 0750 $PGDATA \
-        && sudo -H -u postgres sh -c "/usr/lib/postgresql/${version_major}/bin/initdb -D $PGDATA --auth-local trust --auth-host scram-sha-256"
+    chown -R postgres:postgres \$PGDATA \
+        && chmod 0750 \$PGDATA \
+        && sudo -H -u postgres sh -c "/usr/lib/postgresql/\${version_path}/bin/initdb -D \$PGDATA --auth-local trust --auth-host scram-sha-256"
 else
     echo "PostgreSQL database already initialized, skipping initialization"
 fi
@@ -79,6 +86,16 @@ fi
 echo "Starting PostgreSQL..."
 sudo /etc/init.d/postgresql start \
     && pg_isready -t 60
+
+# Enable PostGIS extension if requested
+if [ "${ENABLE_POSTGIS}" = "true" ]; then
+    echo "Enabling PostGIS extension..."
+    sudo -u postgres psql -c "CREATE EXTENSION IF NOT EXISTS postgis;"
+    sudo -u postgres psql -c "CREATE EXTENSION IF NOT EXISTS postgis_topology;"
+    sudo -u postgres psql -c "CREATE EXTENSION IF NOT EXISTS postgis_raster;"
+    sudo -u postgres psql -c "CREATE EXTENSION IF NOT EXISTS fuzzystrmatch;"
+    sudo -u postgres psql -c "CREATE EXTENSION IF NOT EXISTS postgis_tiger_geocoder;"
+fi
 
 set +e
 
@@ -109,6 +126,7 @@ install_using_apt() {
         version_suffix=""
     else
         version_major="-$(echo "${PG_VERSION}" | grep -oE -m 1 "^([0-9]+)")"
+        version_path="$(echo "${PG_VERSION}" | grep -oE -m 1 "^([0-9]+)")"
         version_suffix="=$(apt-cache show postgresql${version_major} | awk -F"Version: " '{print $2}' | grep -E -m 1 "^(${PG_VERSION})(\.|$|\+.*|-.*)")"
 
         if [ -z ${version_suffix} ] || [ ${version_suffix} = "=" ]; then
@@ -119,7 +137,15 @@ install_using_apt() {
         echo "version_suffix ${version_suffix}"
     fi
 
-    (apt-get install -yq postgresql${version_major}${version_suffix} postgresql-client${version_major} \
+    # Install PostgreSQL packages
+    packages="postgresql${version_major}${version_suffix} postgresql-client${version_major}"
+    
+    # Add PostGIS packages if requested
+    if [ "${ENABLE_POSTGIS}" = "true" ]; then
+        packages="${packages} postgresql${version_major}-postgis-3 postgresql${version_major}-postgis-3-scripts"
+    fi
+    
+    (apt-get install -yq ${packages} \
         && setup_pq) || return 1
 }
 
